@@ -197,57 +197,112 @@ export default function RenzoTrainer() {
   const [totalStars, setTotalStars] = useState(() => parseInt(localStorage.getItem("renzo_stars") || "0"));
   const [streak, setStreak] = useState(() => parseInt(localStorage.getItem("renzo_streak") || "0"));
   const [levelScores, setLevelScores] = useState(() => JSON.parse(localStorage.getItem("renzo_levels") || "{}"));
-  const recognitionRef = useRef(null);
-  const waveTimerRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  const streamRef = useRef(null);
   const [waveActive, setWaveActive] = useState(false);
+  const [processing, setProcessing] = useState(false);
 
   const level = LEVELS[currentLevel];
   const exercise = level?.exercises[currentEx];
 
-  // Speech recognition setup
-  const startListening = useCallback(() => {
-    if (!("webkitSpeechRecognition" in window) && !("SpeechRecognition" in window)) {
-      alert("Tu navegador no soporta reconocimiento de voz. Usa Chrome.");
-      return;
-    }
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    const rec = new SR();
-    rec.lang = "es-CL";
-    rec.interimResults = false;
-    rec.maxAlternatives = 5;
+  const [debugMsg, setDebugMsg] = useState("");
 
-    rec.onstart = () => { setListening(true); setWaveActive(true); setResult(null); setHeardText(""); };
-    rec.onend = () => { setListening(false); setWaveActive(false); };
-    rec.onerror = () => { setListening(false); setWaveActive(false); };
+  const OPENAI_KEY = import.meta.env.VITE_OPENAI_API_KEY;
 
-    rec.onresult = (e) => {
-      const alternatives = Array.from(e.results[0]).map(a => a.transcript.trim());
-      let bestResult = "miss";
-      let bestHeard = alternatives[0];
-      for (const alt of alternatives) {
-        const r = checkMatch(alt, exercise.target);
-        if (["perfect","good","close","miss"].indexOf(r) < ["perfect","good","close","miss"].indexOf(bestResult)) {
-          bestResult = r;
-          bestHeard = alt;
-        }
+  const processAudio = useCallback(async (chunks, mimeType) => {
+    setProcessing(true);
+    setDebugMsg("⏳ Procesando...");
+    try {
+      const blob = new Blob(chunks, { type: mimeType });
+      const ext = mimeType.includes("ogg") ? "ogg" :
+                  mimeType.includes("mp4") ? "mp4" :
+                  mimeType.includes("webm") ? "webm" : "wav";
+      const file = new File([blob], `audio.${ext}`, { type: mimeType });
+
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("model", "whisper-1");
+      formData.append("language", "es");
+
+      const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${OPENAI_KEY}` },
+        body: formData,
+      });
+
+      if (!res.ok) {
+        const err = await res.json();
+        setDebugMsg(`❌ Error Whisper: ${err.error?.message || res.status}`);
+        setProcessing(false);
+        return;
       }
-      setResult(bestResult);
-      setHeardText(bestHeard);
-      setSessionScore(prev => [...prev, bestResult]);
-      if (bestResult === "perfect" || bestResult === "good") {
-        const newStars = totalStars + (bestResult === "perfect" ? 3 : 2);
+
+      const data = await res.json();
+      const transcript = (data.text || "").trim();
+      setDebugMsg(`Escuché: "${transcript}"`);
+
+      const matchResult = checkMatch(transcript, exercise.target);
+      setResult(matchResult);
+      setHeardText(transcript);
+      setSessionScore(prev => [...prev, matchResult]);
+      if (matchResult === "perfect" || matchResult === "good") {
+        const newStars = totalStars + (matchResult === "perfect" ? 3 : 2);
         setTotalStars(newStars);
         localStorage.setItem("renzo_stars", newStars);
       }
-    };
+    } catch (e) {
+      setDebugMsg(`❌ ${e.message}`);
+    } finally {
+      setProcessing(false);
+    }
+  }, [exercise, totalStars, OPENAI_KEY]);
 
-    recognitionRef.current = rec;
-    rec.start();
-  }, [exercise, totalStars]);
+  const startListening = useCallback(async () => {
+    if (!OPENAI_KEY) {
+      setDebugMsg("❌ Falta VITE_OPENAI_API_KEY en Vercel");
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      audioChunksRef.current = [];
+
+      const mimeType =
+        MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" :
+        MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" :
+        MediaRecorder.isTypeSupported("audio/mp4") ? "audio/mp4" :
+        "audio/ogg";
+
+      const recorder = new MediaRecorder(stream, { mimeType });
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunksRef.current.push(e.data); };
+      recorder.onstop = () => {
+        stream.getTracks().forEach(t => t.stop());
+        processAudio(audioChunksRef.current, mimeType);
+      };
+
+      mediaRecorderRef.current = recorder;
+      recorder.start();
+      setListening(true);
+      setWaveActive(true);
+      setResult(null);
+      setHeardText("");
+      setDebugMsg("🎤 Grabando... toca de nuevo para detener");
+    } catch (e) {
+      setDebugMsg(`🚫 Sin acceso al micrófono: ${e.message}`);
+    }
+  }, [OPENAI_KEY, processAudio]);
 
   const stopListening = useCallback(() => {
-    recognitionRef.current?.stop();
+    mediaRecorderRef.current?.stop();
+    setListening(false);
+    setWaveActive(false);
   }, []);
+
+  const toggleListening = useCallback(() => {
+    if (listening) stopListening();
+    else startListening();
+  }, [listening, startListening, stopListening]);
 
   const nextExercise = () => {
     if (currentEx + 1 < level.exercises.length) {
@@ -514,30 +569,45 @@ export default function RenzoTrainer() {
         {/* Mic button */}
         <div style={{ textAlign: "center", marginTop: "auto" }}>
           {!result ? (
-            <button
-              onMouseDown={startListening}
-              onTouchStart={startListening}
-              onMouseUp={stopListening}
-              onTouchEnd={stopListening}
-              style={{
-                width: 100,
-                height: 100,
-                borderRadius: "50%",
-                background: listening
-                  ? "linear-gradient(135deg, #FF6B6B, #EE5A24)"
-                  : `linear-gradient(135deg, ${level.color}, ${level.color}CC)`,
-                border: "none",
-                fontSize: 40,
-                cursor: "pointer",
-                boxShadow: listening
-                  ? "0 0 0 16px rgba(255,107,107,0.2), 0 8px 24px rgba(255,107,107,0.4)"
-                  : `0 8px 24px ${level.color}66`,
-                transition: "all 0.2s",
-                animation: listening ? "pulse 1s ease-in-out infinite" : "none",
-              }}
-            >
-              🎤
-            </button>
+            <>
+              <button
+                onClick={toggleListening}
+                style={{
+                  width: 100,
+                  height: 100,
+                  borderRadius: "50%",
+                  background: listening
+                    ? "linear-gradient(135deg, #FF6B6B, #EE5A24)"
+                    : `linear-gradient(135deg, ${level.color}, ${level.color}CC)`,
+                  border: "none",
+                  fontSize: 40,
+                  cursor: "pointer",
+                  boxShadow: listening
+                    ? "0 0 0 16px rgba(255,107,107,0.2), 0 8px 24px rgba(255,107,107,0.4)"
+                    : `0 8px 24px ${level.color}66`,
+                  transition: "all 0.2s",
+                  animation: listening ? "pulse 1s ease-in-out infinite" : "none",
+                }}
+              >
+                {listening ? "⏹️" : processing ? "⏳" : "🎤"}
+              </button>
+              <div style={{ fontSize: 13, color: "#999", marginTop: 12 }}>
+                {processing ? "Procesando con Whisper..." : listening ? "Habla — toca para detener" : "Toca el micrófono y habla"}
+              </div>
+              {debugMsg && (
+                <div style={{
+                  marginTop: 8,
+                  fontSize: 13,
+                  color: debugMsg.startsWith("❌") || debugMsg.startsWith("🚫") || debugMsg.startsWith("🔇") ? "#E74C3C" : "#636e72",
+                  background: "#F8F9FA",
+                  borderRadius: 10,
+                  padding: "6px 12px",
+                  display: "inline-block",
+                }}>
+                  {debugMsg}
+                </div>
+              )}
+            </>
           ) : (
             <button
               onClick={nextExercise}
@@ -556,11 +626,6 @@ export default function RenzoTrainer() {
             >
               {currentEx + 1 < level.exercises.length ? "Siguiente ›" : "¡Terminar! 🎉"}
             </button>
-          )}
-          {!listening && !result && (
-            <div style={{ fontSize: 13, color: "#999", marginTop: 12 }}>
-              Mantén presionado el micrófono y habla
-            </div>
           )}
         </div>
       </div>
